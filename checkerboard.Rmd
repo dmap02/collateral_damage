@@ -1,0 +1,431 @@
+---
+title: "Checkerboard - regression"
+author: "Diana Proctor"
+date: "2025-07-30"
+output: html_document
+---
+
+
+---
+last updated: `r format(Sys.Date(), format="%B %d %Y")`
+
+***
+
+
+chatGPT was used to help code this up
+
+note: this is to analyze end-point data, not a time course!!!! here, we look at the 24h readings
+
+```{r}
+library(knitr)
+opts_chunk$set(fig.width=12, fig.height=8, 
+               echo=TRUE, warning=FALSE, message=FALSE, error = FALSE)
+```
+
+Load R packages
+```{r}
+# Set seed
+set.seed(78979)
+
+# Define required packages
+packages <- c(
+  # Core tidyverse packages
+  "tidyverse",
+  
+  # Phylogenetics and microbiome analysis
+  "phyloseq",
+  "microbiome",
+  "phangorn",
+  "msa",
+  
+  # Statistical modeling and analysis
+  "lmerTest",
+  "rstatix",
+  "broom",
+  "mediation",
+  "effects",
+  "broom.mixed",
+  "genefilter",
+  "vegan",
+  "ALDEx2",
+  
+  # Visualization enhancements
+  "ggpubr",
+  "ggprism",
+  "gridExtra",
+  "ggbeeswarm",
+  "ggrepel",
+  "cowplot",
+  "ggtext",
+  "reshape2",
+  "pheatmap",
+  
+  # Data import
+  "readxl"
+)
+
+# Install missing CRAN packages
+cran_packages <- setdiff(packages, rownames(installed.packages()))
+cran_packages <- cran_packages[!cran_packages %in% c("phyloseq", "microbiome", "phangorn", "msa", "genefilter", "vegan", "ALDEx2")]
+if(length(cran_packages) > 0) install.packages(cran_packages)
+
+# Install missing Bioconductor packages
+bioc_packages <- c("phyloseq", "microbiome", "phangorn", "msa", "genefilter", "vegan", "ALDEx2")
+bioc_to_install <- setdiff(bioc_packages, rownames(installed.packages()))
+if(length(bioc_to_install) > 0) BiocManager::install(bioc_to_install, update = FALSE)
+
+# Load packages
+n <- length(packages) - sum(sapply(packages, require, character.only = TRUE))
+
+# Print loading status
+if (n == 0) {
+  print("All necessary R packages loaded properly")
+} else {
+  print(paste0(n, " R packages did not load properly"))
+}
+
+#set graphs to the graphpad prism theme
+theme_set(theme_bw())
+
+```
+
+read in the data and merge it together
+
+specifically, we read in the replicates 
+```{r}
+process_checkerboard_data <- function(file_path, sheet = 1) {
+  # Read the Excel sheet
+  raw_data <- read_excel(file_path, sheet = sheet)
+  
+  # Subset the data from row 26 onward
+  data_subset <- as.data.frame(raw_data[26:nrow(raw_data), ])
+  
+  # Remove the first column
+  data_subset <- data_subset[, -1]
+  
+  # Remove the first row
+  cleaned_data <- data_subset[-1, ]
+  cleaned_data$file = file_path
+  return(cleaned_data)
+}
+
+file1 <- "~/Desktop/Staff/Sanduni/Checkerboard assays_Van_Flu_old RPMI/Vanco_Fluco_Pilot Experiment_19_05_2024.xlsx"
+rep1 <- process_checkerboard_data(file1)
+
+
+file2 <- "~/Desktop/Staff/Sanduni/Checkerboard assays_Van_Flu_old RPMI/Vanco_Fluco_Replicate 1_24_05_2024.xlsx"
+rep2 <- process_checkerboard_data(file2)
+
+
+file3 <- "~/Desktop/Staff/Sanduni/Checkerboard assays_Van_Flu_old RPMI/Vanco_Fluco_Replicate 2_ Reading 1_24_05_2025.xlsx"
+rep3 <- process_checkerboard_data(file3)
+
+file4 <- "~/Desktop/Staff/Sanduni/Checkerboard assays_Van_Flu_old RPMI/Vanco_Fluco_Replicate2 _Reading 2_24_05_2025.xlsx"
+rep4 <- process_checkerboard_data(file4)
+
+#make a dataset of all the data
+od_df = data.frame(rbind(rep2, rep3, rep4)) #need to add rep1 
+
+#melt the data
+colnames(od_df) = c("Row", 1:12, "wv", "file")
+# Pivot longer
+od_long <- od_df %>%
+  pivot_longer(
+    cols = `1`:`12`,         # melt columns 1 to 12
+    names_to = "Col",     # new column with the original column names
+    values_to = "OD"         # new column with OD values
+  )
+
+
+```
+
+read in the metadata
+
+```{r, chunk from sanduni}
+# Load metadata
+file="~/Desktop/Staff/Sanduni/Checkerboard assays_Van_Flu_old RPMI/Checkerboard_Van_Flu_23_06_25 @24hr.xlsx"
+meta_df <- read_excel(file, sheet =2)
+
+# Rename row identifiers
+colnames(meta_df)[1] <- "Row"
+```
+
+merge the data and clean it up
+```{r, sanduni code}
+meta_long <- meta_df %>%
+  pivot_longer(-Row, names_to = "Col", values_to = "Condition")
+
+# Combine OD + metadata
+data <- left_join(od_long, meta_long, by = c("Row", "Col")) %>%
+  filter(!is.na(OD), !grepl("EMPTY", OD, ignore.case = TRUE), !is.na(Condition)) %>%
+  mutate(OD = as.numeric(OD))
+
+# Extract Van and Flu concentrations
+data2 <- data %>%
+  mutate(
+    FluRaw = str_extract(Condition, "Flu\\s*[0-9.]+"),
+    FluConc = as.numeric(str_extract(FluRaw, "[0-9.]+")),
+    VanRaw = str_extract(Condition, "Van\\s*[0-9.]+"),
+    VanConc = as.numeric(str_extract(VanRaw, "[0-9.]+"))
+  )
+
+```
+
+merge OD with pH data
+```{r}
+
+#read in the pH data
+phdata = read_excel("~/Desktop/ABX_Project/pH and Matrices.xlsx")
+phdata_long <- phdata %>%
+  dplyr::rename(Van = `Van/Flu`) %>%
+  pivot_longer(
+    cols = -Van,
+    names_to = "Flu",
+    values_to = "pH"
+  ) %>%
+  mutate(Flu = as.numeric(Flu))  
+
+#merge pH data with the OD data
+mydata = merge(phdata_long, data2  ) 
+#View(mydata)
+
+
+mydata = subset(mydata, Condition !="EMPTY")
+#look at predictors
+table(mydata$pH) #pH varies between 5 and 6; it's a qualitative assessment not numeric
+
+#how correlated are they? 
+cor(mydata$Van, as.numeric(as.character(mydata$pH))) #very 
+```
+
+let's look at the data
+```{r}
+p = ggplot(mydata, aes(sqrt(pH), sqrt(Van))) + geom_point()
+p= ggplot(mydata, aes(as.factor(Van), OD)) + geom_boxplot() + facet_wrap(~Flu)
+p= ggplot(mydata, aes(as.factor(pH), OD)) + geom_boxplot() + facet_wrap(~Flu)
+```
+
+normalize within plates - modified the code sanduni wrote
+we will also just plot the raw data
+```{r}
+# Get control OD values per file and FluConc
+control_vals <- data2 %>%
+  filter(
+    str_detect(Condition, regex("Control", ignore_case = TRUE)) &
+    str_detect(Condition, regex("Van 0", ignore_case = TRUE))
+  ) %>%
+  group_by(file, FluConc) %>%
+  summarise(Control_OD = mean(OD, na.rm = TRUE), .groups = "drop")
+
+#Join back to full dataset
+data3 <- left_join(data2, control_vals, by = c("file", "FluConc")) %>%
+  mutate(GrowthPercent = (OD / Control_OD) * 100)
+
+# create heatmap matrix per file (list of matrices)
+heatmap_list <- data3 %>%
+  group_by(file, VanConc, FluConc) %>%
+  summarise(Growth = mean(GrowthPercent, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(FluConc), FluConc != 0) %>%   # remove NA and zero fluconazole columns
+  group_split(file) %>%
+  setNames(unique(data3$file)) %>%
+  lapply(function(df) {
+    # Pivot so rows = VanConc, columns = FluConc, values = Growth
+    mat_data <- df %>%
+      pivot_wider(names_from = FluConc, values_from = Growth) %>%
+      arrange(VanConc)         # sort rows by VanConc ascending
+    
+    # Remove rows with NA VanConc (if any)
+    mat_data <- mat_data %>% filter(!is.na(VanConc))
+    
+    # Remove columns that are all NA (sometimes happens if a FluConc had no data)
+    na_cols <- sapply(mat_data, function(col) all(is.na(col)))
+    mat_data <- mat_data[, !na_cols]
+    
+    # Extract matrix without the VanConc column
+    mat <- as.matrix(mat_data[, !(names(mat_data) %in% c("VanConc", "file"))])
+
+    
+    # Ensure matrix is numeric (important for plotting)
+    mode(mat) <- "numeric"
+    
+    # Assign VanConc values as row names
+    rownames(mat) <- as.character(mat_data$VanConc)
+    
+    return(mat)
+  })
+
+########plot the heatmaps for each file
+color_breaks <- seq(0, 300, length.out = 100)  # fixed color scale from 0 to 300
+
+heatmap_plots <- list()
+
+for (file_name in names(heatmap_list)) {
+  file_base <- tools::file_path_sans_ext(basename(file_name))
+  
+  heatmap_obj <- pheatmap(
+    heatmap_list[[file_name]],
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    main = file_base,
+    silent = TRUE,
+    breaks = color_breaks
+  )
+  
+  heatmap_plots[[file_base]] <- heatmap_obj[[4]]
+}
+combined_plot <- cowplot::plot_grid(plotlist = heatmap_plots, ncol = 2)  # or adjust ncol
+combined_plot
+
+```
+
+
+let's get the average of the three replicates
+```{r} 
+# Assuming heatmap_list contains matrices of identical dimensions
+
+# Convert list to 3D array: [row, col, replicate]
+heatmap_array <- simplify2array(heatmap_list)
+
+# Compute mean across the third dimension (replicates)
+average_matrix <- apply(heatmap_array, c(1, 2), mean, na.rm = TRUE)
+
+# View or return the result
+print(average_matrix)
+avg_plot = pheatmap(average_matrix,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    main = file_base,
+    silent = TRUE,
+    breaks = color_breaks)
+avg_plot
+```
+ 
+we can see that vancomycin explained 12% of the variation while pH explains 15%. in the combined model, we only account for 22% of the variation, which is less than 12+15. This confirms that the effect of ph and the effect of vancomycin overlap to some degree and account for a shared proportion of the explained variance in the combined model
+
+```{r}
+#merge pH with data3
+colnames(phdata_long) = c("VanConc", "FluConc", "pH")
+data4 = merge(data3, phdata_long)
+
+# Fit the models (note we will use hierarchical regression)
+mod_van <- lm(GrowthPercent ~ VanConc+FluConc, data = data4) #vancomycin alone
+mod_ph <- lm(GrowthPercent ~ pH+FluConc, data = data4) #pH alone
+mod_van_ph <- lm(GrowthPercent ~ VanConc + pH + FluConc, data = data4) #both 
+
+# Extract R-squared values
+R2_van <- summary(mod_van)$r.squared
+R2_ph <- summary(mod_ph)$r.squared
+R2_van_ph <- summary(mod_van_ph)$r.squared
+
+# Calculate unique and shared variance components
+unique_van <- R2_van_ph - R2_ph          # variance Van explains beyond pH
+unique_ph  <- R2_van_ph - R2_van         # variance pH explains beyond Van
+shared     <- R2_van + R2_ph - R2_van_ph # overlap in variance explained
+
+# Print results
+cat("R² Van alone:", 100*(round(R2_van, 4)), "\n")
+cat("R² pH alone:", 100*(round(R2_ph, 4)), "\n")
+cat("R² Van + pH:", 100*(round(R2_van_ph, 4)), "\n\n")
+
+cat("Unique variance explained by Van:", 100*(round(R2_van, 4)), "\n")
+cat("Unique variance explained by pH:", 100*(round(R2_ph, 4)), "\n")
+cat("Shared variance explained by both:", 100*(round(R2_van_ph, 4)), "\n")
+```
+
+let's test for interactions between van and pH while holding fluconazole constant
+
+- when we do this, vancomycin is not significant
+- the interaction between van and ph is marginally significant with a positive effect size, indicating a positive effect on growth and that the effect of vancomycin depends on ph or vice versa
+- the effect of flu is significant and negative, as expected
+- when we look at just pH 6, higher vancomycin concentrations is associated with higher growth
+```{r}
+mod_interact <- lm(GrowthPercent ~ VanConc * FluConc * pH, data = data4)
+summary(mod_interact)
+
+
+#try to look at the of vancomycin and ph across fluconazole
+ggplot(data4, aes(x = VanConc, y = sqrt(GrowthPercent), color = as.factor(pH))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + facet_wrap(~FluConc)
+
+#try to look at how vancomycin and fluconazole interact across ph gradient
+ggplot(data4, aes(x = pH, y = GrowthPercent, color = as.factor(VanConc))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + facet_wrap(~FluConc) #when we look at just pH 6, higher vancomycin concentrations is associated with higher growth
+```
+
+
+let's try the mediation analysis
+
+Mediation framework here:
+
+    Predictor (X): Van (vancomycin concentration)
+
+    Mediator (M): pH (qualitative but treated numerically or factor)
+
+    Outcome (Y): Growth
+    
+    ACME (Average Causal Mediation Effect): Effect of Van on Growth through pH (the mediated path)
+
+    ADE (Average Direct Effect): Effect of Van on Growth not through pH (the direct path)
+
+    Total Effect: Sum of direct + mediated effects
+
+    Proportion Mediated: How much of the total effect is due to mediation by pH
+    
+  
+```{r}
+# Mediator model (predict pH by Van)
+med.mod <- lm(pH ~ VanConc +FluConc, data = data4)
+
+# Outcome model (predict Growth by Van and pH)
+out.mod <- lm(GrowthPercent ~ VanConc + pH + FluConc, data = data4)
+
+#run the mediation
+med.out <- mediate(med.mod, out.mod, treat = "VanConc", mediator = "pH", boot = TRUE, sims = 1000)
+summary(med.out)
+plot(med.out)
+sensitivity <- medsens(med.out)
+plot(sensitivity)
+
+```
+
+
+
+
+let's test whether the vancomycin-fluconazole interaction is significant when we hold pH consta nt
+
+```{r}
+mod_growth <- lm(GrowthPercent ~ VanConc * FluConc + pH, data = data4)
+summary(mod_growth)
+```
+let's plot some regression diagnostics
+```{r}
+library(ggfortify)
+autoplot(mod_growth)
+```
+
+chatGPT suggested using this to plot interactions
+```{r}
+plot(allEffects(mod_growth))
+```
+
+let's standardize the predictors
+```{r}
+data4$Van_std <- scale(data4$VanConc)
+data4$pH_std <- scale(data4$pH)
+data4$Flu_std <- scale(data4$FluConc)
+mod_interact <- lm(GrowthPercent ~ Van_std * pH_std * Flu_std, data = data4)
+summary(mod_interact)
+autoplot(mod_interact)
+```
+
+```{r}
+p = ggplot(data4, aes(as.factor(pH), GrowthPercent)) + geom_boxplot() + geom_point()
+p
+p = ggplot(data4, aes(as.factor(pH), GrowthPercent)) + geom_boxplot() + geom_point() + facet_wrap(~FluConc)
+p
+p = ggplot(data4, aes(as.factor(VanConc), GrowthPercent, shape=as.factor(pH), color=as.factor(FluConc))) + geom_point(size=3) 
+p
+```
+
