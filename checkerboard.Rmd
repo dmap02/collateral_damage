@@ -59,6 +59,7 @@ packages <- c(
   "ggtext",
   "reshape2",
   "pheatmap",
+  "ggfortify",
   
   # Data import
   "readxl"
@@ -355,54 +356,11 @@ ggplot(data4, aes(x = pH, y = GrowthPercent, color = as.factor(VanConc))) +
 ```
 
 
-let's try the mediation analysis
-
-Mediation framework here:
-
-    Predictor (X): Van (vancomycin concentration)
-
-    Mediator (M): pH (qualitative but treated numerically or factor)
-
-    Outcome (Y): Growth
-    
-    ACME (Average Causal Mediation Effect): Effect of Van on Growth through pH (the mediated path)
-
-    ADE (Average Direct Effect): Effect of Van on Growth not through pH (the direct path)
-
-    Total Effect: Sum of direct + mediated effects
-
-    Proportion Mediated: How much of the total effect is due to mediation by pH
-    
-  
-```{r}
-# Mediator model (predict pH by Van)
-med.mod <- lm(pH ~ VanConc +FluConc, data = data4)
-
-# Outcome model (predict Growth by Van and pH)
-out.mod <- lm(GrowthPercent ~ VanConc + pH + FluConc, data = data4)
-
-#run the mediation
-med.out <- mediate(med.mod, out.mod, treat = "VanConc", mediator = "pH", boot = TRUE, sims = 1000)
-summary(med.out)
-plot(med.out)
-sensitivity <- medsens(med.out)
-plot(sensitivity)
-
-```
-
-
-
-
 let's test whether the vancomycin-fluconazole interaction is significant when we hold pH consta nt
 
 ```{r}
 mod_growth <- lm(GrowthPercent ~ VanConc * FluConc + pH, data = data4)
 summary(mod_growth)
-```
-let's plot some regression diagnostics
-```{r}
-library(ggfortify)
-autoplot(mod_growth)
 ```
 
 chatGPT suggested using this to plot interactions
@@ -429,3 +387,90 @@ p = ggplot(data4, aes(as.factor(VanConc), GrowthPercent, shape=as.factor(pH), co
 p
 ```
 
+
+### try to permute vancomycin concentrations
+
+While holding pH and Fluconazole concentration constant in the model, the observed effect of Vancomycin concentration on growth percentage was substantially greater than expected under the null hypothesis. In a permutation test with 1000 random shuffles of Vancomycin concentration, only 4 permutations produced p-values smaller than the observed p-value, indicating that the likelihood of observing such a strong effect by chance is very low (empirical p-value = 0.004), much lower than the typical 5% threshold used to delcare significance. This provides strong evidence that Vancomycin concentration has a significant influence on growth, independent of the effects of pH and Fluconazole, and is unlikely to be a false positive.
+
+
+
+```{r}
+set.seed(123)
+n_perms <- 1000
+
+# Vectors/lists to store permutation results
+vancoefs <- numeric(n_perms)  # VanConc coef from each permuted model
+van_p_vals <- numeric(n_perms) # p values from permuted model 
+perm_resid_vs_fitted <- vector("list", n_perms)
+
+for (i in 1:n_perms) {
+  data4$VanConc_perm <- sample(data4$VanConc)  # shuffle VanConc
+
+  # Fit permuted model
+  perm_mod <- lm(GrowthPercent ~ VanConc_perm + pH + FluConc, data = data4)
+  
+  # Store VanConc coefficient (permuted)
+  vancoefs[i] <- coef(perm_mod)["VanConc_perm"]
+  van_p_vals[i] <- summary(perm_mod)$coefficients["VanConc_perm", "Pr(>|t|)"]
+  # Store Residuals vs Fitted data for diagnostics
+  perm_resid_vs_fitted[[i]] <- data.frame(
+    Fitted = fitted(perm_mod),
+    Residuals = resid(perm_mod),
+    Permutation = i
+  )
+}
+
+# Fit original model (unpermuted)
+obs_mod <- lm(GrowthPercent ~ VanConc + pH + FluConc, data = data4)
+obs_coef <- coef(obs_mod)["VanConc"]
+obs_p <- summary(obs_mod)$coefficients["VanConc", "Pr(>|t|)"]
+
+# Plot histogram of permuted VanConc coefficients with observed value line
+p1 = ggplot(data.frame(vancoefs), aes(x = vancoefs)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+  geom_vline(xintercept = obs_coef, color = "red", size = 1.2) +
+  labs(title = "Permutation distribution of VanConc coefficients",
+       x = "VanConc coefficient",
+       y = "Frequency") +
+  theme_minimal()
+
+#plot the p values
+p2 = ggplot(data.frame(van_p_vals), aes(x = van_p_vals)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+  geom_rect(aes(xmin = 0, xmax = 0.05, ymin = 0, ymax = Inf),
+            fill = "pink", alpha = 0.05, inherit.aes = FALSE) +
+  labs(title = "Permutation distribution of VanConc p-values",
+       x = "VanConc p-value",
+       y = "Frequency") +
+  theme_minimal() +  geom_vline(xintercept = obs_p, color = "red", size = 1.2) 
+
+
+plot_grid(p1, p2, ncol=2)
+###########how many permuted p values were < 0.05
+num_less_than_obs <- sum(van_p_vals < obs_p)
+total_perms <- length(van_p_vals)
+
+cat("Out of", total_perms, "permutations,", num_less_than_obs, 
+    "had p-values less than the observed p-value of", round(obs_p, 5), ".\n")
+
+if (num_less_than_obs == 0) {
+  cat("None of the permutations had a p-value smaller than the observed p-value — strong evidence against the null hypothesis.\n")
+} else {
+  cat("This means about", round(100 * num_less_than_obs / total_perms, 2), 
+      "% of permutations had smaller p-values than the observed one,\n")
+}
+
+```
+
+
+let's try to remove the effect of pH and then run our regression model. susan said to do this, but i should make sure i'm doing it right by checking with julia. this suggests that the effect of vancomcyin after controlling for pH is negative
+
+```{r}
+mod_ph <- lm(pH ~ VanConc, data = data4)
+data4$pH_resid <- resid(mod_ph)
+
+# Now pH_resid is the part of pH not explained by VanConc
+mod <- lm(GrowthPercent ~ VanConc + pH_resid, data = data4)
+summary(mod)
+
+```
