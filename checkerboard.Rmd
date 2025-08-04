@@ -300,6 +300,24 @@ avg_plot = pheatmap(average_matrix,
     breaks = color_breaks)
 avg_plot
 ```
+
+
+get the average increase in growth
+```{r}
+# Convert to numeric matrix if it's not already
+avg_mat_numeric <- as.matrix(average_matrix)
+
+# Subtract 100 from each value to get the increase over baseline
+increase_matrix <- avg_mat_numeric - 100
+
+# Remove the baseline row (since it’s all 0s after subtraction)
+increase_matrix_no0 <- increase_matrix[-1, ]
+
+# Compute the average increase across columns for each Vancomycin concentration
+average_increase_by_vanco <- rowMeans(increase_matrix_no0)
+average_increase_by_vanco
+```
+
  
 we can see that vancomycin explained 12% of the variation while pH explains 15%. in the combined model, we only account for 22% of the variation, which is less than 12+15. This confirms that the effect of ph and the effect of vancomycin overlap to some degree and account for a shared proportion of the explained variance in the combined model
 
@@ -331,6 +349,8 @@ cat("R² Van + pH:", 100*(round(R2_van_ph, 4)), "\n\n")
 cat("Unique variance explained by Van:", 100*(round(R2_van, 4)), "\n")
 cat("Unique variance explained by pH:", 100*(round(R2_ph, 4)), "\n")
 cat("Shared variance explained by both:", 100*(round(R2_van_ph, 4)), "\n")
+
+autoplot(mod_van_ph)
 ```
 
 let's test for interactions between van and pH while holding fluconazole constant
@@ -390,7 +410,7 @@ p
 
 ### try to permute vancomycin concentrations
 
-While holding pH and Fluconazole concentration constant in the model, the observed effect of Vancomycin concentration on growth percentage was substantially greater than expected under the null hypothesis. In a permutation test with 1000 random shuffles of Vancomycin concentration, only 4 permutations produced p-values smaller than the observed p-value, indicating that the likelihood of observing such a strong effect by chance is very low (empirical p-value = 0.004), much lower than the typical 5% threshold used to delcare significance. This provides strong evidence that Vancomycin concentration has a significant influence on growth, independent of the effects of pH and Fluconazole, and is unlikely to be a false positive.
+While holding pH and Fluconazole concentration constant in the model, the observed effect of Vancomycin concentration on growth percentage was substantially greater than expected under the null hypothesis. In a permutation test with 1000 random shuffles of Vancomycin concentration, only 4 permutations produced p-values smaller than the observed p-value, indicating that the likelihood of observing such a strong effect by chance is very low (empirical p-value = 0.004), much lower than the typical 5% threshold used to delcare significance. Additionally, the effect sizes were all significantly less than the observed effect size. This provides strong evidence that Vancomycin concentration has a significant influence on growth, beyond its effects on pH, and is unlikely to be a false positive.
 
 
 
@@ -460,17 +480,80 @@ if (num_less_than_obs == 0) {
       "% of permutations had smaller p-values than the observed one,\n")
 }
 
+mean(van_p_vals)
 ```
 
+### try to permute vancomycin concentrations after removing 25, 50
 
-let's try to remove the effect of pH and then run our regression model. susan said to do this, but i should make sure i'm doing it right by checking with julia. this suggests that the effect of vancomcyin after controlling for pH is negative
+even when we remove these big outliers the effects are still significant
 
 ```{r}
-mod_ph <- lm(pH ~ VanConc, data = data4)
-data4$pH_resid <- resid(mod_ph)
+set.seed(123)
+n_perms <- 1000
+data5 = subset(data4, !(VanConc %in% c(25, 50)))
 
-# Now pH_resid is the part of pH not explained by VanConc
-mod <- lm(GrowthPercent ~ VanConc + pH_resid, data = data4)
-summary(mod)
+# Vectors/lists to store permutation results
+vancoefs <- numeric(n_perms)  # VanConc coef from each permuted model
+van_p_vals <- numeric(n_perms) # p values from permuted model 
+perm_resid_vs_fitted <- vector("list", n_perms)
 
+for (i in 1:n_perms) {
+  data5$VanConc_perm <- sample(data5$VanConc)  # shuffle VanConc
+
+  # Fit permuted model
+  perm_mod <- lm(GrowthPercent ~ VanConc_perm + pH + FluConc, data = data5)
+  
+  # Store VanConc coefficient (permuted)
+  vancoefs[i] <- coef(perm_mod)["VanConc_perm"]
+  van_p_vals[i] <- summary(perm_mod)$coefficients["VanConc_perm", "Pr(>|t|)"]
+  # Store Residuals vs Fitted data for diagnostics
+  perm_resid_vs_fitted[[i]] <- data.frame(
+    Fitted = fitted(perm_mod),
+    Residuals = resid(perm_mod),
+    Permutation = i
+  )
+}
+
+# Fit original model (unpermuted)
+obs_mod <- lm(GrowthPercent ~ VanConc + pH + FluConc, data = data5)
+obs_coef <- coef(obs_mod)["VanConc"]
+obs_p <- summary(obs_mod)$coefficients["VanConc", "Pr(>|t|)"]
+autoplot(obs_mod)
+# Plot histogram of permuted VanConc coefficients with observed value line
+p1 = ggplot(data.frame(vancoefs), aes(x = vancoefs)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+  geom_vline(xintercept = obs_coef, color = "red", size = 1.2) +
+  labs(title = "Permutation distribution of VanConc coefficients",
+       x = "VanConc coefficient",
+       y = "Frequency") +
+  theme_minimal()
+
+#plot the p values
+p2 = ggplot(data.frame(van_p_vals), aes(x = van_p_vals)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+  geom_rect(aes(xmin = 0, xmax = 0.05, ymin = 0, ymax = Inf),
+            fill = "pink", alpha = 0.05, inherit.aes = FALSE) +
+  labs(title = "Permutation distribution of VanConc p-values",
+       x = "VanConc p-value",
+       y = "Frequency") +
+  theme_minimal() +  geom_vline(xintercept = obs_p, color = "red", size = 1.2) 
+
+
+plot_grid(p1, p2, ncol=2)
+###########how many permuted p values were < 0.05
+num_less_than_obs <- sum(van_p_vals < obs_p)
+total_perms <- length(van_p_vals)
+
+cat("Out of", total_perms, "permutations,", num_less_than_obs, 
+    "had p-values less than the observed p-value of", round(obs_p, 5), ".\n")
+
+if (num_less_than_obs == 0) {
+  cat("None of the permutations had a p-value smaller than the observed p-value — strong evidence against the null hypothesis.\n")
+} else {
+  cat("This means about", round(100 * num_less_than_obs / total_perms, 2), 
+      "% of permutations had smaller p-values than the observed one,\n")
+}
+
+mean(van_p_vals)
 ```
+

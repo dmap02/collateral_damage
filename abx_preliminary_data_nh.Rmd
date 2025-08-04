@@ -1,0 +1,485 @@
+---
+title: "Antibiotic analysis of Nat Med paper"
+author: "Diana Proctor"
+date: "07/14/2025"
+output: html_document
+---
+
+
+Let's get the antibiotic, antiviral, steroid and antifungal data coded up in a way that we can analyze their impact on the nursing home microbiome
+
+```{r}
+#set global knitting options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE, fig.width = 12, fig.height = 5)
+```
+
+```{r, echo=FALSE}
+# List of CRAN packages
+cran_packages <- c(
+  "tidyverse",
+  "plotly",
+  "ggpubr",
+  "ggbeeswarm",
+  "ggordiplots",
+  "wesanderson",
+  "viridis",
+  "scales",
+  "cowplot",
+  "gridExtra",
+  "phyloseq",
+  "magrittr",
+  "reshape2",
+  "knitr",
+  "htmlTable",
+  "dabestr",
+  "stringr"
+)
+
+# List of Bioconductor packages
+bioc_packages <- c(
+  "mixOmics",
+  "DESeq2",
+  "genefilter",
+  "effects"
+)
+
+# Install BiocManager if missing
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Install missing CRAN packages
+for (pkg in cran_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# Install missing Bioconductor packages
+for (pkg in bioc_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+# Load all packages
+all_packages <- c(cran_packages, bioc_packages)
+for (pkg in all_packages) {
+  library(pkg, character.only = TRUE)
+}
+#devtools::install_github("nt-williams/rxnorm")
+
+library("rxnorm")
+
+```
+
+Define functions and color palettes
+```{r, echo=FALSE}
+########## define some functions
+#this updatest the theme for ggplot, making barplots in a standardize
+#it hand
+add_barplot_elements <- function(x) {
+      theme_update() +
+        theme(plot.title = element_text(color="black", size=12, face="bold.italic"),
+        axis.title.x = element_text(color="black", size=12, face="bold"),
+        axis.title.y = element_text(color="black", size=12, face="bold"),
+        text = element_text(size=12),
+        axis.text.x = element_text(angle=90, hjust=1),
+        panel.spacing = unit(0, "lines"),
+        strip.background = element_blank(),
+        strip.placement = "outside") 
+}
+
+
+add_NSubjects <- function(phy) {
+    map = as.data.frame(as.matrix(sample_data(phy))) %>%
+      dplyr::count(., Unique_ptid, sort = FALSE, name = "NSamplesPerSubject")  %>%
+      plyr::join(., data.frame(sample_data(phy)), by = "Unique_ptid") %>%
+      tibble::column_to_rownames(., "LibraryID")%>%
+      sample_data(.)
+}
+
+
+add_NSites <- function(phy) {
+      map = as.data.frame(as.matrix(sample_data(phy))) %>%
+      dplyr::group_by(., Unique_ptid) %>%
+      dplyr::count(., SiteID,  name = "NSamplesPerSubjectSite")
+      df = as.data.frame(map)
+      new_map = merge(df, sample_data(merged_16s), by=c("Unique_ptid", "SiteID"))
+      rownames(new_map) = new_map$LibraryID
+      new_map = sample_data(new_map)
+      return(new_map)
+}
+
+
+phyToDf <- function(phy, level) {
+      ra = transform_sample_counts(phy, function(x) x/sum(x))
+      domain.phy <- tax_glom(ra, taxrank=level)
+      tax.count <- data.frame(data.frame(domain.phy@tax_table@.Data, t(otu_table(domain.phy))))
+      dfm = melt(tax.count, colnames(tax_table(domain.phy))) 
+      colnames(dfm)[colnames(dfm) == 'variable'] <- 'LibraryID'
+      df = plyr::join(dfm, data.frame(sample_data(domain.phy)))
+      return(df)
+}
+
+
+apply_VST_transformation <- function(phy){
+    vstF_phy <- phy
+      #add 1 to OTU counts
+      otu_table(vstF_phy) <- otu_table(vstF_phy) + 1
+      #create deseq object
+      vstF.ds = phyloseq_to_deseq2(vstF_phy)
+
+     #regularlized log transformation
+      Index25.VST <- varianceStabilizingTransformation(vstF.ds, blind=TRUE, fitType = "local") 
+      counts_full_VST <- otu_table(as.matrix(assay(Index25.VST)), taxa_are_rows=TRUE)
+      #exchange otu tables
+      otu_table(vstF_phy) <- counts_full_VST 
+      otus.vst = otu_table(vstF_phy)    
+      return(otus.vst)
+}
+
+```
+
+
+
+Read in the amplicon data
+```{r, fig.height=10}
+bac_match = readRDS("~/OneDrive\ -\ UTHealth\ Houston/Expansion-2024/NIH-2024/Desktop/Nature_Medicine/data/phyloseq/merged_16s_bac_match_cauris_clinical_map_withsqrt_withtree_withcoo_2020-03-19.rds") %>%
+  subset_samples(., Survey_Period==1) 
+
+map = data.frame(sample_data(bac_match)) %>%
+  dplyr::select(., c("site","Unique_ptid", "LibraryID", "chg_conc", "CFUTotal_Cauris","CFUTransform_Cauris", "Cauris_Result",
+                     "Site.Extended", "SiteID", "mech_vent",  "trach", "gtube", "ostomy", "fecal_device", "urinary_cath",
+                     "Fungal.Matcher",           "caurisReads",              "percentAuris"            )) %>%
+  sample_data(.)
+sample_data(bac_match) = map
+
+sites =  read.csv("~/OneDrive\ -\ UTHealth\ Houston/Expansion-2024/NIH-2024/Desktop/Nature_Medicine/data/metadata/sitecode_to_factored_sites.csv")
+full.dat = readxl::read_excel("~/OneDrive\ -\ UTHealth\ Houston/Expansion-2024/NIH-2024/Desktop/Nature_Medicine/data/metadata/Cauris_Medications_2020-07-23.xlsx") %>%
+  subset(., DrugClass %in% c("ANTIBIOTICS", "ANTIFUNGALS", "STEROIDS", "ANTIVIRALS"))
+
+```
+
+we need to clean up the antibiotic, antiviral, steroid and antifungal data
+- determine how many days before each sample period these were taken
+- standardize the names of the meds to a code that can be inter operable
+```{r}
+# Make sure your dates are Date type
+full.dat$Survey1_CollectDate <- as.Date(full.dat$Survey1_CollectDate)
+full.dat$StartDate <- as.Date(full.dat$StartDate)
+
+# Create a new column: days between StartDate and Survey 1, 2, 3
+full.dat$Days_Before_Survey1 <- as.numeric(difftime(full.dat$Survey1_CollectDate, full.dat$StartDate, units = "days"))
+full.dat$Days_Before_Survey2 <- as.numeric(difftime(full.dat$Survey2_CollectDate, full.dat$StartDate, units = "days"))
+full.dat$Days_Before_Survey3 <- as.numeric(difftime(full.dat$Survey3_CollectDate, full.dat$StartDate, units = "days"))
+```
+
+
+ATCodeR package - we get standard codes for 31 drugs but not all 54 unique drugs
+```{r, eval=FALSE}
+# Load ATCodeR package and standardize the drug names
+library(ATCodeR)
+library(dplyr)
+
+input_test = data.frame(input_med = full.dat$MedName) %>%
+  distinct(.) #54
+test_df <- ATCtransform(input.df = input_test, column_name = "input_med") #31 drugs were processed
+
+# Assuming your dataframe is called test_df
+#unassigned_drugs <- test_df %>%
+ # filter(
+ #   AdditionalMedication == "" &
+ #   Medication == "" &
+#    Info == ""
+  #) %>%
+#  dplyr::select(input_med)
+
+unassigned_drugs
+```
+
+let's try another method suggested by chatGPT whichaccesses the RxNorm package using a direct HTTP request (using the httr package) to the RxNorm REST API provided by the National Library of Medicine (NLM).4
+
+- note that when we ran raw drug names through there were 14 that were not classified because of information added to the primary drug name
+- using the clean function was done iteratively to determine what else we needed to clean to increase the number of rxcui codes obtained
+- this leaves us with 8 drugs that can't be classified; 2 because they're just "antifungal" and 6 because they are combinations
+- not sure how to handle the drugs with multiple ingredients
+
+
+```{r}
+library(httr)
+library(jsonlite)
+library(purrr)
+library(dplyr)
+library(stringr)
+
+test_df <- data.frame(input_med = full.dat$MedName) %>%
+  distinct()
+
+# Enhanced cleaning function
+clean_name <- function(name) {
+  name %>%
+    tolower() %>%
+    # Remove common salts and modifiers, both whole phrases and parts
+    gsub("\\b(sodium succinate|sod succinate|sod succ|sodium succ|nitrate|acetate|succinate|ace|sod|pot clavulanate|potassium clavulanate|chloride)\\b", "", ., ignore.case = TRUE) %>%
+    # Remove dosage forms and administration routes
+    gsub("\\b(tablet|cream|ointment|%|patch|capsule|solution|syrup|injection|suspension|powder|oral|dextrose|sensimist|remedy|spray|gel|lotion|cream|eye drop|eye drops|cream)\\b", "", ., ignore.case = TRUE) %>%
+    # Remove strength or dosage numbers (e.g. 0.5, 10 mg)
+    gsub("\\b\\d+(\\.\\d+)?\\b", "", .) %>%
+    # Replace dots, dashes, slashes with spaces
+    gsub("[./-]", " ", .) %>%
+    # Remove any leftover punctuation
+    gsub("[[:punct:]]", "", .) %>%
+    # Remove extra spaces
+    str_squish() %>%
+    # Trim spaces
+    trimws()
+}
+
+# Apply cleaning
+drug_names <- test_df$input_med
+cleaned_names <- sapply(drug_names, clean_name)
+
+# Function to get RxCUI (same as before)
+get_rxcui <- function(drug_name) {
+  if (is.na(drug_name) || drug_name == "") return(NA)
+  url <- paste0("https://rxnav.nlm.nih.gov/REST/rxcui.json?name=", URLencode(drug_name))
+  res <- httr::GET(url)
+  if (res$status_code == 200) {
+    content <- fromJSON(httr::content(res, "text", encoding = "UTF-8"))
+    if (!is.null(content$idGroup$rxnormId)) {
+      return(content$idGroup$rxnormId[[1]])
+    }
+  }
+  return(NA)
+}
+
+# Get unique cleaned names to avoid repeated queries
+unique_cleaned <- unique(cleaned_names)
+
+# Map to RxCUI once per unique name
+rxcui_map <- map_chr(unique_cleaned, get_rxcui)
+
+# Create lookup table
+lookup <- data.frame(cleaned_drug = unique_cleaned, rxcui = rxcui_map, stringsAsFactors = FALSE)
+
+# Join back to full data
+results <- data.frame(original_drug = drug_names, cleaned_drug = cleaned_names, stringsAsFactors = FALSE) %>%
+  left_join(lookup, by = "cleaned_drug")
+
+# Summary
+unmatched_count <- sum(is.na(results$rxcui))
+cat("Unmatched drugs:", unmatched_count, "\n")
+
+failed_drugs <- results %>% filter(is.na(rxcui))
+
+# Add delimiter for manual checking if needed
+failed_drugs$cleaned_drug_delim <- str_replace_all(failed_drugs$cleaned_drug, " ", " / ")
+print(failed_drugs)
+
+
+```
+
+
+get the multiple ingredient drugs (MIN) RxCui codes
+- programmatically my efforts failed
+- i manually got the multiple component drugs and now we only have 3 lines that aren't annotated, 1 drug for which we will use the name since it's a penicillin and 2 that are to generall too nail down
+```{r}
+url <- "https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=amoxicillin%20pot%20clavulanate"
+res <- httr::GET(url)
+content <- fromJSON(httr::content(res, "text", encoding = "UTF-8"))
+
+str(content$approximateGroup)
+
+# Check if candidate exists and what it contains
+if (!is.null(content$approximateGroup$candidate)) {
+  print(content$approximateGroup$candidate)
+} else {
+  print("No candidates found")
+}
+#i googled these codes and got them manually on July 14, 2025
+# Your manual lookup as a data.frame
+manual_rxcui_df <- data.frame(
+  MedName = c(
+    "Sulfamethoxazole - Trimethoprim",
+    "Piperacillin-Tazobactam",
+    "Ampicillin-Sulbactam",
+    "Neomycin/polymixin/bacitracin",
+    "Piperacillin-Tazobactam-Dextrose",
+    "Amoxicillin-Pot Clavulanate"
+  ),
+  manual_rxcui = c("10831", "74169", "1009148", "C5835035", "74169", "Amoxicillin-Pot Clavulanate"),
+  stringsAsFactors = FALSE
+)
+results$MedName = results$original_drug
+results_updated <- results %>%
+  left_join(manual_rxcui_df, by = "MedName") %>%
+  mutate(rxcui = if_else(is.na(rxcui), manual_rxcui, rxcui)) %>%  # fill NAs
+  dplyr::select(-manual_rxcui)  # remove helper column
+
+
+# List drugs that still failed
+failed_drugs <- results_updated %>% filter(is.na(rxcui))
+
+```
+
+merge with the original data4
+
+- Amoxicillin-Pot Clavulanate is the only drug i can't seem to get right
+```{r}
+colnames(results)[1] = "MedName"
+
+mydf = plyr::join(results_updated, full.dat)
+failed_drugs <- mydf %>% filter(is.na(rxcui))
+
+```
+
+now let's convert our cleaned drug names into a binary variable
+ 
+
+```{r}
+# Ensure mydf is a data.table
+data.table::setDT(mydf)
+
+# Keep only Unique_ptid, cleaned_drug, and create presence = 1
+mydf_small <- mydf[, .(Unique_ptid, cleaned_drug)]
+mydf_small[, present := 1]
+
+# dcast to wide format with one row per Unique_ptid
+wide_df <- dcast(mydf_small, Unique_ptid ~ cleaned_drug, value.var = "present", fill = 0, fun.aggregate = max)
+
+#merge with sample map
+map = data.frame(sample_data(bac_match))
+Freq = data.frame(table(map$Unique_ptid, map$Cauris_Result))
+colnames(Freq) = c("Unique_ptid", "Cauris_Result", "N.Colonized.Sites")
+
+
+#let's see how many samples per person
+NSamples = data.frame(table(map$Unique_ptid))
+colnames(NSamples) = c("Unique_ptid",  "N.Samples")
+annotations = plyr::join(Freq, NSamples)
+
+#let's calculate the candida index which is the numer of colonized sites / number of sites
+annotations$Candida_index = round(annotations$N.Colonized.Sites/annotations$N.Samples, 2)
+df = plyr::join(wide_df, annotations)
+
+#update the map 
+map$Cauris_Result = NULL
+new.map <- merge(df, map) %>%
+  filter(complete.cases(SiteID)) %>%
+  distinct(Fungal.Matcher, .keep_all = TRUE) %>%
+  column_to_rownames("Fungal.Matcher") %>%
+  sample_data()
+
+
+sample_data(bac_match) = sample_data(new.map)
+
+```
+
+```{r}
+library(lme4)
+library(reshape2) # for colsplit
+
+# Fix column names with dots replacing spaces (if needed)
+abx_vars <- stringr::str_replace_all(colnames(new.map)[7:42], " ", ".")
+
+# Recover Subject and Site from rownames (assuming rownames like "Subject;Site")
+foo <- colsplit(rownames(new.map), pattern = ";", names = c("Unique_ptid", "site"))
+
+# Assign recovered columns back to new.map (make sure new.map is a data.frame)
+new.map <- data.frame(new.map)
+new.map$Unique_ptid <- foo$Unique_ptid
+new.map$site <- foo$site  # overwriting existing site column if needed
+
+# Build formula string without Survey_Period
+fixed_effects <- paste(c(abx_vars, "site"), collapse = " + ")
+formula_str <- paste("Candida_index ~", fixed_effects, "+ (1 | Unique_ptid)")
+
+# Convert to formula object
+model_formula <- as.formula(formula_str)
+
+# Fit linear mixed effects model
+lmer_model <- lmer(model_formula, data = new.map)
+
+# Check model summary
+summary(lmer_model)
+
+```
+
+let's look for correlation among antibiotics
+```{r, fig.width=8, fig.height=8}
+# Load necessary libraries
+library(Hmisc)
+library(ggcorrplot)
+library(corrplot)
+# Compute correlation matrix with significance values
+res <- rcorr(as.matrix(new.map[, abx_vars]), type = "pearson")
+
+# Extract correlation and p-value matrices
+cor_mat <- res$r
+p_mat <- res$P
+
+# Plot only significant correlations (e.g., p < 0.05)
+library(Hmisc)
+library(corrplot)
+
+# Compute correlation and p-values
+res <- rcorr(as.matrix(new.map[, abx_vars]), type = "pearson")
+cor_mat <- res$r
+p_mat <- res$P
+
+# Enhanced visualization
+ggcorrplot(
+  cor_mat,
+  method = "square",         # or "circle"
+  type = "full",            # upper triangle only
+  p.mat = p_mat,             # p-value matrix
+  sig.level = 0.05,          # threshold for significance
+  insig = "blank",           # hide insignificant values
+  colors = c("#2166AC", "white", "#B2182B"),  # diverging palette
+  title = "Significant Correlations",
+  legend.title = "r",
+  show.diag = FALSE
+) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    plot.title = element_text(hjust = 0.5)
+  ) + ylab("") + xlab("")
+
+
+
+
+```
+
+
+
+
+
+
+
+effect of antibiotics on the microbiome - permanova 
+```{r, eval=FALSE}
+# Compute distance matrix
+dist_mat <- phyloseq::distance(merged_physeq, method = "bray")
+
+# Sample metadata
+meta <- data.frame(sample_data(merged_physeq))
+
+# Choose a site to subset if needed
+# site_meta <- meta[meta$SiteID == "Ne", ]
+# dist_mat <- as.dist(as.matrix(dist_mat)[rownames(site_meta), rownames(site_meta)])
+
+# Build a formula including all antibiotics
+abx_vars <- colnames(meta)[3:ncol(meta)]
+formula_str <- paste("dist_mat ~", paste(abx_vars, collapse = " + "))
+
+# Run PERMANOVA
+adonis_result <- adonis2(as.formula(formula_str), data = meta, by="terms")
+adonis_result
+
+
+#let's see if the antibiotics are the predictor of c.a uris colonization
+
+```
+
+
