@@ -315,7 +315,7 @@ increase_matrix_no0 <- increase_matrix[-1, ]
 
 # Compute the average increase across columns for each Vancomycin concentration
 average_increase_by_vanco <- rowMeans(increase_matrix_no0)
-average_increase_by_vanco
+
 ```
 
  
